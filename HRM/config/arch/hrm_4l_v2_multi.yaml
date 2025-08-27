@@ -1,0 +1,48 @@
+name: hrm.hrm_4l_act_multi@HierarchicalReasoningModel4L_ACTMulti
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+
+# ACT
+halt_exploration_prob: 0.1
+halt_max_steps: 16
+
+# Timescales
+A_cycles: 2
+M_per_B: 4
+B_per_A: 2
+C_every_A: 2
+
+# Layers per level
+C_layers: 2
+M_layers: 4
+B_layers: 4
+A_layers: 2
+
+# Transformer config
+hidden_size: 512
+num_heads: 8
+expansion: 4
+
+puzzle_emb_ndim: ${.hidden_size}
+pos_encodings: rope
+
+# Vedic control
+use_film: true
+num_chitta_slots: 8
+ego_token: true
+num_plan_tokens: 0
+
+# Ablations
+freeze_c_writes: false
+disable_c_read_in_b: false
+
+# Multi-thinker CMBA + G
+num_thinkers: 10
+share_parameters: true
+num_g_slots: 1
+g_update_every_A: 2
+aggregator_layers: 2
+aggregator_hidden: 0
+
+
