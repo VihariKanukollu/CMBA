@@ -1,0 +1,39 @@
+name: hrm.hrm_4l_act_v3@HierarchicalReasoningModel4L_ACTV3
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+
+# ACT
+halt_exploration_prob: 0.1
+halt_max_steps: 16
+
+# N-level scheduler (fast -> slow)
+num_levels: 6
+levels_layers: [2, 2, 2, 2, 2, 2]
+levels_cycles: [16, 8, 4, 2, 1, 1]
+
+# Transformer config
+hidden_size: 512
+num_heads: 8
+expansion: 4
+
+puzzle_emb_ndim: ${.hidden_size}
+pos_encodings: rope
+
+# Injection/gating
+input_injection: cross_attn   # attention-based integration at Layer I
+topdown_to_bottom: true       # include top-level context into level 0
+cross_attn_levels: [0]        # enable cross-attn on selected levels (0 = fastest)
+cross_attn_in_settle: false   # apply cross-attn during no_grad settle (kept off for speed)
+
+# Graph reasoning (Layer II/III)
+enable_graph_reasoning: true
+graph_structure: learned      # learned | grid | fully_connected
+graph_top_k: 8                # sparsify adjacency to top-k neighbors
+graph_in_settle: false        # apply graph messages during settle (kept off for speed)
+
+# Consistency-driven halting bias (metric always computed; bias off by default)
+consistency_halting_bias: 0.0
+consistency_bias_eval_only: true
+
+forward_dtype: bfloat16
