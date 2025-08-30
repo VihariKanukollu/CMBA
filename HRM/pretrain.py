@@ -1,4 +1,5 @@
 from typing import Optional, Any, Sequence, List
+import json
 from dataclasses import dataclass
 import os
 import math
@@ -69,6 +70,22 @@ class PretrainConfig(pydantic.BaseModel):
     eval_interval: Optional[int] = None
     eval_save_outputs: List[str] = []
 
+    # Console logging (for Jupyter/terminal visibility)
+    console_log: bool = True
+    console_log_train_every_n_steps: int = 50
+    console_log_eval: bool = True
+    console_log_max_items: int = 6
+    console_log_eval_print_all: bool = True
+    console_log_train_keys: List[str] = [
+        "train/accuracy",
+        "train/exact_accuracy",
+        "train/lm_loss",
+        "train/q_halt_accuracy",
+        "train/q_halt_loss",
+        "train/steps",
+    ]
+    console_log_compact_names: bool = True
+
 
 @dataclass
 class TrainState:
@@ -133,28 +150,31 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                 for param in list(model.parameters()) + list(model.buffers()):
                     dist.broadcast(param, src=0)
 
-    # Optimizers and lr
-    optimizers = [
-        CastedSparseEmbeddingSignSGD_Distributed(
-            model.model.puzzle_emb.buffers(),  # type: ignore
-            
-            lr=0,  # Needs to be set by scheduler
-            weight_decay=config.puzzle_emb_weight_decay,
+    # Optimizers and lr (guard sparse embedding optimizer if puzzle_emb is absent)
+    optimizers: List[torch.optim.Optimizer] = []
+    optimizer_lrs: List[float] = []
 
-            world_size=world_size
-        ),
+    puzzle_emb = getattr(model.model, "puzzle_emb", None)  # type: ignore
+    if puzzle_emb is not None:
+        optimizers.append(
+            CastedSparseEmbeddingSignSGD_Distributed(
+                puzzle_emb.buffers(),  # type: ignore
+                lr=0,  # set by scheduler
+                weight_decay=config.puzzle_emb_weight_decay,
+                world_size=world_size
+            )
+        )
+        optimizer_lrs.append(config.puzzle_emb_lr)
+
+    optimizers.append(
         AdamATan2(
             model.parameters(),
-
-            lr=0,  # Needs to be set by scheduler
+            lr=0,  # set by scheduler
             weight_decay=config.weight_decay,
             betas=(config.beta1, config.beta2)
         )
-    ]
-    optimizer_lrs = [
-        config.puzzle_emb_lr,
-        config.lr
-    ]
+    )
+    optimizer_lrs.append(config.lr)
 
     return model, optimizers, optimizer_lrs
 
@@ -189,11 +209,16 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
 
 def save_train_state(config: PretrainConfig, train_state: TrainState):
     # FIXME: Only saved model.
+    print(f"DEBUG: checkpoint_path={config.checkpoint_path}")
     if config.checkpoint_path is None:
+        print("DEBUG: checkpoint_path is None, not saving")
         return
 
+    save_path = os.path.join(config.checkpoint_path, f"step_{train_state.step}")
+    print(f"DEBUG: Saving checkpoint to {save_path}")
     os.makedirs(config.checkpoint_path, exist_ok=True)
-    torch.save(train_state.model.state_dict(), os.path.join(config.checkpoint_path, f"step_{train_state.step}"))
+    torch.save(train_state.model.state_dict(), save_path)
+    print(f"DEBUG: Checkpoint saved successfully")
 
 
 def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
@@ -229,6 +254,13 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         for param in train_state.model.parameters():
             if param.grad is not None:
                 dist.all_reduce(param.grad)
+    # Gradient clipping (after gradient sync)
+    try:
+        clip_norm = float(os.environ.get("GRAD_CLIP_NORM", "1.0"))
+    except Exception:
+        clip_norm = 1.0
+    if clip_norm and clip_norm > 0:
+        torch.nn.utils.clip_grad_norm_(train_state.model.parameters(), max_norm=clip_norm)
             
     # Apply optimizer
     lr_this_step = None    
@@ -318,14 +350,27 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
                 dist.reduce(metric_values, dst=0)
             
             if rank == 0:
-                reduced_metrics = metric_values.cpu().numpy()
-                reduced_metrics = {set_name: {metric_name: reduced_metrics[set_id, metric_id] for metric_id, metric_name in enumerate(metric_keys)}
+                reduced_metrics_np = metric_values.cpu().numpy()
+                reduced_metrics = {set_name: {metric_name: reduced_metrics_np[set_id, metric_id] for metric_id, metric_name in enumerate(metric_keys)}
                                    for set_id, set_name in enumerate(set_ids)}
                 
                 # Postprocess
                 for set_name, metrics in reduced_metrics.items():
                     count = metrics.pop("count")
                     reduced_metrics[set_name] = {k: v / count for k, v in metrics.items()}
+
+                # Aggregate "all" across sets weighted by count
+                if "count" in metric_keys and len(set_ids):
+                    count_idx = {name: i for i, name in enumerate(metric_keys)}["count"]
+                    total_count = float(reduced_metrics_np[:, count_idx].sum())
+                    if total_count > 0:
+                        all_dict = {}
+                        for metric_id, metric_name in enumerate(metric_keys):
+                            if metric_name == "count":
+                                continue
+                            all_value = float(reduced_metrics_np[:, metric_id].sum() / total_count)
+                            all_dict[metric_name] = all_value
+                        reduced_metrics["all"] = all_dict
 
                 return reduced_metrics
 
@@ -397,6 +442,13 @@ def launch(hydra_config: DictConfig):
 
     # Seed RNGs to ensure consistency
     torch.random.manual_seed(config.seed + RANK)
+    # Enable TF32 for improved numerical stability/perf on Ampere+
+    try:
+        torch.set_float32_matmul_precision('high')
+        torch.backends.cuda.matmul.allow_tf32 = True  # type: ignore[attr-defined]
+        torch.backends.cudnn.allow_tf32 = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
     # Dataset
     train_epochs_per_iter = config.eval_interval if config.eval_interval is not None else config.epochs
@@ -413,7 +465,7 @@ def launch(hydra_config: DictConfig):
     # Progress bar and logger
     progress_bar = None
     if RANK == 0:
-        progress_bar = tqdm.tqdm(total=train_state.total_steps)
+        progress_bar = tqdm.tqdm(total=train_state.total_steps, dynamic_ncols=True)
 
         wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
@@ -432,15 +484,86 @@ def launch(hydra_config: DictConfig):
                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
 
+                # Inline training metrics display in Jupyter/terminal
+                if config.console_log and (train_state.step % max(1, config.console_log_train_every_n_steps) == 0):
+                    # Prepare a brief, readable subset for postfix
+                    desired_keys = config.console_log_train_keys or []
+                    items = []
+                    source_keys = desired_keys if len(desired_keys) else sorted(metrics.keys())
+                    for k in source_keys:
+                        if k not in metrics:
+                            continue
+                        try:
+                            v = float(metrics[k])
+                        except Exception:
+                            try:
+                                v = float(metrics[k].item())  # type: ignore[attr-defined]
+                            except Exception:
+                                continue
+                        items.append((k, v))
+                        if len(items) >= config.console_log_max_items:
+                            break
+                    key_alias = {
+                        "train/accuracy": "acc",
+                        "train/exact_accuracy": "xacc",
+                        "train/lm_loss": "lm",
+                        "train/q_halt_accuracy": "qh_acc",
+                        "train/q_halt_loss": "qh_loss",
+                        "train/steps": "steps",
+                        "train/lr": "lr",
+                        "train/count": "count",
+                    } if config.console_log_compact_names else {}
+                    postfix = {key_alias.get(k, k): (round(v, 6) if abs(v) < 1e4 else round(v, 2)) for k, v in items}
+                    if len(postfix):
+                        progress_bar.set_postfix(postfix, refresh=True)  # type: ignore
+
         ############ Evaluation
         train_state.model.eval()
         metrics = evaluate(config, train_state, eval_loader, eval_metadata, rank=RANK, world_size=WORLD_SIZE)
 
         if RANK == 0 and metrics is not None:
             wandb.log(metrics, step=train_state.step)
+            if config.console_log_eval:
+                # Flatten and print a concise evaluation summary
+                flat = {}
+                for set_name, vals in metrics.items():
+                    for k, v in vals.items():
+                        try:
+                            flat[f"{set_name}/{k}"] = float(v)
+                        except Exception:
+                            try:
+                                flat[f"{set_name}/{k}"] = float(v.item())  # type: ignore[attr-defined]
+                            except Exception:
+                                pass
+                # Keep only a handful of items for readability
+                keys = sorted(flat.keys())[: config.console_log_max_items]
+                brief = {k: (round(flat[k], 6) if abs(flat[k]) < 1e4 else round(flat[k], 2)) for k in keys}
+                msg = f"Eval@step {train_state.step}: " + json.dumps(brief)
+                if progress_bar is not None:
+                    progress_bar.write(msg)
+                else:
+                    print(msg)
+                # Optionally also print the full aggregated 'all' block untruncated
+                if config.console_log_eval_print_all and "all" in metrics:
+                    all_block = {}
+                    for k, v in metrics["all"].items():
+                        try:
+                            all_block[k] = float(v)
+                        except Exception:
+                            try:
+                                all_block[k] = float(v.item())  # type: ignore[attr-defined]
+                            except Exception:
+                                all_block[k] = str(v)
+                    full_msg = f"Eval(all)@step {train_state.step}: " + json.dumps(all_block)
+                    if progress_bar is not None:
+                        progress_bar.write(full_msg)
+                    else:
+                        print(full_msg)
             
         ############ Checkpointing
-        if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
+        should_checkpoint = config.checkpoint_every_eval or (_iter_id == total_iters - 1)
+        print(f"DEBUG: _iter_id={_iter_id}, total_iters={total_iters}, checkpoint_every_eval={config.checkpoint_every_eval}, should_checkpoint={should_checkpoint}")
+        if RANK == 0 and should_checkpoint:
             save_train_state(config, train_state)
 
     # finalize

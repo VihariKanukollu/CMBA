@@ -266,7 +266,7 @@ class HRMMLA(nn.Module):
     def __init__(self, hidden_size: int, num_heads: int,
                  q_lora_rank: int, kv_lora_rank: int,
                  qk_nope_head_dim: int, qk_rope_head_dim: int, v_head_dim: int,
-                 rope_factor: float, mscale: float):
+                 rope_factor: float, mscale: float, attn_impl: str = "naive"):
         super().__init__()
         global world_size
         self.hidden_size = hidden_size
@@ -278,6 +278,7 @@ class HRMMLA(nn.Module):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         self.v_head_dim = v_head_dim
+        self.attn_impl = attn_impl
 
         if q_lora_rank == 0:
             self.wq = ColumnParallelLinearV3(hidden_size, num_heads * self.qk_head_dim)
@@ -293,14 +294,19 @@ class HRMMLA(nn.Module):
 
         # softmax rescale for long context
         self.softmax_scale = (self.qk_head_dim ** -0.5) * (1.0 if rope_factor <= 1.0 else (0.1 * mscale * math.log(max(rope_factor, 1.0001)) + 1.0) ** 2)
+        # factor relative to default 1/sqrt(d)
+        self.extra_scale = float(self.softmax_scale / (self.qk_head_dim ** -0.5))
 
     def _apply_rotary(self, q_pe: torch.Tensor, k_pe: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # q_pe: [b, s, h, d], k_pe: [b, s, 1, d], cos/sin: [s, d]
+        # Match cos/sin dtype to q_pe to avoid unintended upcasting
+        cos = cos.to(q_pe.dtype)
+        sin = sin.to(q_pe.dtype)
         q = (q_pe * cos.unsqueeze(-2)) + (_rotate_half(q_pe) * sin.unsqueeze(-2))
         k = (k_pe * cos.unsqueeze(-2)) + (_rotate_half(k_pe) * sin.unsqueeze(-2))
         return q, k
 
-    def forward(self, cos_sin: Optional[CosSin], hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, cos_sin: Optional[CosSin], hidden_states: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         bsz, seqlen, _ = hidden_states.size()
         if self.q_lora_rank == 0:
             q = self.wq(hidden_states)
@@ -326,11 +332,34 @@ class HRMMLA(nn.Module):
         k = torch.cat([k_nope, k_pe], dim=-1)
         q = torch.cat([q_nope, q_pe], dim=-1)
 
-        scores = torch.einsum("bshd,bthd->bsht", q, k) * self.softmax_scale
-        attn = scores.softmax(dim=-1, dtype=torch.float32).type_as(hidden_states)
-        x = torch.einsum("bsht,bthd->bshd", attn, v)
-        x = self.wo(x.flatten(2))
-        return x
+        if self.attn_impl == "sdp":
+            # Scaled dot-product attention (flash/mem-efficient when available)
+            # Adjust q by extra scaling to match custom softmax scale
+            if self.extra_scale != 1.0:
+                q = q * self.extra_scale
+            # Permute to [b, h, s, d]
+            qh = q.permute(0, 2, 1, 3)
+            kh = k.permute(0, 2, 1, 3)
+            vh = v.permute(0, 2, 1, 3)
+            # Ensure matching dtypes across q/k/v
+            if vh.dtype != qh.dtype:
+                vh = vh.to(qh.dtype)
+            # attn_mask shape [s, t] or broadcastable; ensure dtype matches query
+            mask = attn_mask.to(qh.dtype) if attn_mask is not None else None
+            # Let PyTorch pick the best kernel; avoid context-manager to keep Dynamo happy
+            xh = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=mask, dropout_p=0.0, is_causal=False)
+            x = xh.permute(0, 2, 1, 3)
+            x = self.wo(x.flatten(2))
+            return x
+        else:
+            scores = torch.einsum("bshd,bthd->bsht", q, k) * self.softmax_scale
+            if attn_mask is not None:
+                scores = scores + attn_mask.to(scores.dtype).unsqueeze(0).unsqueeze(2)
+            # Softmax in float32 for numerical stability, then cast back
+            attn = scores.softmax(dim=-1, dtype=torch.float32).type_as(hidden_states)
+            x = torch.einsum("bsht,bthd->bshd", attn, v)
+            x = self.wo(x.flatten(2))
+            return x
 
 
 @dataclass
@@ -398,6 +427,11 @@ class HierarchicalReasoningModel4L_ACTV3Config(BaseModel):
     attn_impl: str = "naive"  # placeholder for future variants
     use_parallel_embedding: bool = False
 
+    # Output vocabulary (can be much smaller than input vocab for classification-style outputs)
+    output_vocab_size: int = 16
+    # Auxiliary language reconstruction from M-level (input BPE recon)
+    aux_recon_loss_weight: float = 0.0
+
     # Halting Q-learning config
     halt_max_steps: int
     halt_exploration_prob: float
@@ -432,6 +466,9 @@ class HierarchicalReasoningModel4L_ACTV3Config(BaseModel):
     # Compile
     compile_modules: bool = False
 
+    # Causal decoding over A-level (LM-like behavior for output region)
+    causal_in_a: bool = False
+
 
 class HierarchicalReasoningModel4L_ACTV3Block(nn.Module):
     def __init__(self, config: HierarchicalReasoningModel4L_ACTV3Config) -> None:
@@ -447,6 +484,7 @@ class HierarchicalReasoningModel4L_ACTV3Block(nn.Module):
             v_head_dim=config.v_head_dim,
             rope_factor=config.rope_factor,
             mscale=config.mscale,
+            attn_impl=config.attn_impl,
         )
 
         inter = _find_multiple(round(config.expansion * config.hidden_size * 2 / 3), 256)
@@ -460,9 +498,9 @@ class HierarchicalReasoningModel4L_ACTV3Block(nn.Module):
         self.attn_norm = RMSNormLearnable(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = RMSNormLearnable(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Pre-Norm residual
-        hidden_states = hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=self.attn_norm(hidden_states))
+        hidden_states = hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=self.attn_norm(hidden_states), attn_mask=attn_mask)
         hidden_states = hidden_states + self.ffn(self.ffn_norm(hidden_states))
         return hidden_states
 
@@ -473,12 +511,12 @@ class HierarchicalReasoningModel4L_ACTV3ReasoningModule(nn.Module):
 
         self.layers = torch.nn.ModuleList(layers)
 
-    def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
         # Input injection (add)
         hidden_states = hidden_states + input_injection
         # Layers
         for layer in self.layers:
-            hidden_states = layer(hidden_states=hidden_states, **kwargs)
+            hidden_states = layer(hidden_states=hidden_states, attn_mask=attn_mask, **kwargs)
 
         return hidden_states
 
@@ -502,7 +540,13 @@ class HierarchicalReasoningModel4L_ACTV3_Inner(nn.Module):
             self.embed_tokens = ParallelEmbeddingV3(self.config.vocab_size, self.config.hidden_size, cast_to=self.forward_dtype)
         else:
             self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
-        self.lm_head      = ColumnParallelLinearV3(self.config.hidden_size, self.config.vocab_size, bias=False)
+        # Output head projects to output vocab size (small classification set, e.g., digits)
+        self.lm_head      = ColumnParallelLinearV3(self.config.hidden_size, self.config.output_vocab_size, bias=False)
+        # Auxiliary reconstruction head over input BPE vocab (optional)
+        if self.config.aux_recon_loss_weight > 0.0:
+            self.recon_head = ColumnParallelLinearV3(self.config.hidden_size, self.config.vocab_size, bias=False)
+        else:
+            self.recon_head = None
         self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
 
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  # ceil div
@@ -701,7 +745,7 @@ class HierarchicalReasoningModel4L_ACTV3_Inner(nn.Module):
     def _mtp_weights(self) -> List[float]:
         return [self.config.mtp_gamma ** (k - 1) for k in range(1, self.config.mtp_num_future + 1)]
 
-    def forward(self, carry: HierarchicalReasoningModel4L_ACTV3InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel4L_ACTV3InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], List[torch.Tensor]]:
+    def forward(self, carry: HierarchicalReasoningModel4L_ACTV3InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel4L_ACTV3InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], List[torch.Tensor], Optional[torch.Tensor]]:
         # Input encoding
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"]).to(self.forward_dtype)
 
@@ -753,11 +797,19 @@ class HierarchicalReasoningModel4L_ACTV3_Inner(nn.Module):
                 # A updates from B using A-shaped injection with [EGO] pooling
                 base_len = input_embeddings.shape[-2]
                 inj_A = torch.zeros_like(z_A)
-                # [EGO] token receives pooled B
-                inj_A[:, 0] = self._mean_pool(z_B)
-                # Remaining A tokens align to last base_len tokens of B (exclude plan tokens)
-                inj_A[:, 1:] = z_B[:, -base_len:]
-                z_A = self.A_level(z_A, inj_A, **self._seq_info_for(z_A.shape[-2]))
+                if self.config.ego_token:
+                    # [EGO] token receives pooled B
+                    inj_A[:, 0] = self._mean_pool(z_B)
+                    # Remaining A tokens align to last base_len tokens of B (exclude plan tokens)
+                    inj_A[:, 1:] = z_B[:, -base_len:]
+                else:
+                    # No ego token: align all A tokens to last base_len tokens of B
+                    inj_A[:, :] = z_B[:, -z_A.shape[-2]:]
+                a_len = z_A.shape[-2]
+                a_mask = None
+                if self.config.causal_in_a:
+                    a_mask = torch.full((a_len, a_len), float("-inf"), device=z_A.device, dtype=z_A.dtype).triu_(1)
+                z_A = self.A_level(z_A, inj_A, attn_mask=a_mask, **self._seq_info_for(z_A.shape[-2]))
 
                 # C slow write (skip last A step before grad)
                 is_last_A = (_a_step == self.config.A_cycles - 1)
@@ -802,9 +854,16 @@ class HierarchicalReasoningModel4L_ACTV3_Inner(nn.Module):
         # A grad update from B with A-shaped injection
         base_len = input_embeddings.shape[-2]
         inj_A = torch.zeros_like(z_A)
-        inj_A[:, 0] = self._mean_pool(z_B)
-        inj_A[:, 1:] = z_B[:, -base_len:]
-        z_A = self.A_level(z_A, inj_A, **self._seq_info_for(z_A.shape[-2]))
+        if self.config.ego_token:
+            inj_A[:, 0] = self._mean_pool(z_B)
+            inj_A[:, 1:] = z_B[:, -base_len:]
+        else:
+            inj_A[:, :] = z_B[:, -z_A.shape[-2]:]
+        a_len = z_A.shape[-2]
+        a_mask = None
+        if self.config.causal_in_a:
+            a_mask = torch.full((a_len, a_len), float("-inf"), device=z_A.device, dtype=z_A.dtype).triu_(1)
+        z_A = self.A_level(z_A, inj_A, attn_mask=a_mask, **self._seq_info_for(z_A.shape[-2]))
 
         # Optional C write on grad step as well
         if (not self.config.freeze_c_writes) and (max(1, self.config.C_every_A) == 1):
@@ -827,8 +886,13 @@ class HierarchicalReasoningModel4L_ACTV3_Inner(nn.Module):
 
         # Multi-Token Prediction logits
         mtp_logits = self._mtp_logits_from_base(logits)
+        # Auxiliary reconstruction logits
+        recon_logits: Optional[torch.Tensor] = None
+        if self.recon_head is not None:
+            base_len = input_embeddings.shape[-2]
+            recon_logits = self.recon_head(z_M[:, :base_len])
         
-        return new_carry, logits, (q_logits[..., 0], q_logits[..., 1]), mtp_logits
+        return new_carry, logits, (q_logits[..., 0], q_logits[..., 1]), mtp_logits, recon_logits
 
 
 class HierarchicalReasoningModel4L_ACTV3(nn.Module):
@@ -867,15 +931,17 @@ class HierarchicalReasoningModel4L_ACTV3(nn.Module):
         # Forward inner model (use inference_mode when not training)
         if not self.training:
             with torch.inference_mode():
-                new_inner_carry, logits, (q_halt_logits, q_continue_logits), mtp_logits = self.inner(new_inner_carry, new_current_data)
+                new_inner_carry, logits, (q_halt_logits, q_continue_logits), mtp_logits, recon_logits = self.inner(new_inner_carry, new_current_data)
         else:
-            new_inner_carry, logits, (q_halt_logits, q_continue_logits), mtp_logits = self.inner(new_inner_carry, new_current_data)
+            new_inner_carry, logits, (q_halt_logits, q_continue_logits), mtp_logits, recon_logits = self.inner(new_inner_carry, new_current_data)
 
         outputs = {
             "logits": logits,
             "q_halt_logits": q_halt_logits,
             "q_continue_logits": q_continue_logits
         }
+        if recon_logits is not None:
+            outputs["recon_logits"] = recon_logits
 
         if self.config.mtp_num_future > 0:
             outputs["mtp_logits"] = mtp_logits
@@ -899,8 +965,8 @@ class HierarchicalReasoningModel4L_ACTV3(nn.Module):
 
                 halted = halted & (new_steps >= min_halt_steps)
 
-                # Compute target Q (bootstrapping)
-                next_q_halt_logits, next_q_continue_logits = self.inner(new_inner_carry, new_current_data)[-2]
+                # Compute target Q (bootstrapping) – explicitly grab q logits tuple
+                _nc, _lg, (next_q_halt_logits, next_q_continue_logits), _ml, _rl = self.inner(new_inner_carry, new_current_data)
                 
                 outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
@@ -908,10 +974,10 @@ class HierarchicalReasoningModel4L_ACTV3(nn.Module):
         if getattr(self.inner, "_last_g_C_write", None) is not None:
             outputs["g_C_write"] = self.inner._last_g_C_write
             
-        # Surface FiLM alphas for debugging if available
+        # Surface FiLM alphas for debugging if available (as tensors to avoid graph breaks)
         if getattr(self.inner, "_last_alpha_M", None) is not None:
-            outputs["alpha_M_mean"] = self.inner._last_alpha_M.mean().item()
-            outputs["alpha_B_mean"] = self.inner._last_alpha_B.mean().item()
+            outputs["alpha_M_mean"] = self.inner._last_alpha_M.mean().detach()
+            outputs["alpha_B_mean"] = self.inner._last_alpha_B.mean().detach()
 
         return HierarchicalReasoningModel4L_ACTV3Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
 

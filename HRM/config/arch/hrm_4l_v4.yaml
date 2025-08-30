@@ -1,62 +1,65 @@
-name: hrm.hrm_4l_act_v3@HierarchicalReasoningModel4L_ACTV3
+name: hrm.hrm_4l_act_v4@HierarchicalReasoningModel4L_ACTV3
 loss:
   name: losses@ACTLossHead
   loss_type: stablemax_cross_entropy
 
 # ACT
-halt_exploration_prob: 0.1
-halt_max_steps: 16
+halt_exploration_prob: 0.05
+halt_max_steps: 32
 
 # Timescales
-A_cycles: 2
-M_per_B: 4
-B_per_A: 2
+A_cycles: 3
+M_per_B: 6
+B_per_A: 3
 C_every_A: 2
 
 # Layers per level
 C_layers: 2
-M_layers: 4
-B_layers: 4
-A_layers: 2
+M_layers: 6
+B_layers: 6
+A_layers: 3
 
 # Transformer config
-hidden_size: 512
-num_heads: 8
+hidden_size: 768
+num_heads: 12
 expansion: 4
 
 puzzle_emb_ndim: ${.hidden_size}
 pos_encodings: rope
 
-# Yarn / long-context
-original_seq_len: 512
+# Yarn / long-context (tuned for 2048 tokens)
+original_seq_len: 1024
 rope_theta: 10000.0
-rope_factor: 8.0
+rope_factor: 4.0
 beta_fast: 32
 beta_slow: 1
 mscale: 1.0
 
 # MLA
 q_lora_rank: 0
-kv_lora_rank: 256
+kv_lora_rank: 384
 qk_nope_head_dim: 64
 qk_rope_head_dim: 32
 v_head_dim: 64
+attn_impl: naive
 use_parallel_embedding: false
+output_vocab_size: 16
+aux_recon_loss_weight: 0.0
 
 # Vedic control
 use_film: true
-num_chitta_slots: 8
+num_chitta_slots: 16
 ego_token: true
-num_plan_tokens: 0
+num_plan_tokens: 8
 
 # Ablations
 freeze_c_writes: false
 disable_c_read_in_b: false
 
-# MoE
-use_moe: false
-n_routed_experts: 16
-n_activated_experts: 4
+# MoE (light)
+use_moe: true
+n_routed_experts: 8
+n_activated_experts: 2
 n_expert_groups: 1
 n_limited_groups: 1
 route_scale: 1.0
@@ -65,8 +68,13 @@ router_noise_std: 0.0
 router_temperature: 1.0
 
 # MTP
-mtp_num_future: 0
+mtp_num_future: 2
 mtp_gamma: 0.5
 
 # Compile
 compile_modules: false
+
+# A-level causal decoding for rationale/answer generation
+causal_in_a: true
+
+

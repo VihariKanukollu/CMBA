@@ -9,3 +9,5 @@ wandb
 omegaconf
 hydra-core
 huggingface_hub
+datasets
+sentencepiece
